@@ -46,7 +46,7 @@ const char* API_URL =
 // Remote schedule (updated by GitHub Action). Falls back to the baked-in
 // path_schedule.h if this fetch fails.
 const char* SCHEDULE_URL =
-    "https://raw.githubusercontent.com/brandonsung/path-clock/main/schedule.json";
+    "https://raw.githubusercontent.com/bsung1/path-clock/main/schedule.json";
 
 CRGB leds[NUM_LEDS];
 
@@ -417,9 +417,11 @@ void setup() {
 // Runs on core 0: fetches on an interval without blocking rendering.
 void fetchTask(void* param) {
   unsigned long lastSched = 0;
+  bool firstRun = true;
   for (;;) {
-    // Refresh the remote schedule periodically (or on first run).
-    if (millis() - lastSched > SCHEDULE_INTERVAL_MS) {
+    // Refresh the remote schedule periodically (and immediately on first run).
+    if (firstRun || millis() - lastSched > SCHEDULE_INTERVAL_MS) {
+      firstRun = false;
       lastSched = millis();
       fetchSchedule();
     }
