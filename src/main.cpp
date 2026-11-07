@@ -32,6 +32,14 @@
 #define MAX_TRAINS        6     // how many upcoming trains to display
 #define USE_SCHEDULE      true  // fill in trains beyond the 2 from the live API
 #define FORCE_ALERT       false // TEST: force the service-alert display on
+#define DEBUG_LOG         true  // verbose serial logging (set false to quiet)
+
+// Verbose logging macro - compiles out when DEBUG_LOG is false.
+#if DEBUG_LOG
+  #define DBG(...) Serial.printf(__VA_ARGS__)
+#else
+  #define DBG(...) do {} while (0)
+#endif
 
 // --- Timing ----------------------------------------------------------------
 #define FETCH_INTERVAL_MS  30000UL        // poll the live API every 30s
@@ -205,7 +213,7 @@ bool fetchTrains() {
 
   String payload = http.getString();
   http.end();
-  Serial.printf("HTTP 200, %u bytes\n", payload.length());
+  DBG("HTTP 200, %u bytes\n", payload.length());
 
   JsonDocument doc;
   DeserializationError err = deserializeJson(doc, payload);
@@ -260,13 +268,13 @@ bool fetchTrains() {
 
   int liveCount = 0;
   for (int i = 0; i < localCount; i++) if (local[i].live) liveCount++;
-  Serial.printf("Fetched %d live + %d scheduled = %d total\n",
-                liveCount, localCount - liveCount, localCount);
+  DBG("Fetched %d live + %d scheduled = %d total\n",
+      liveCount, localCount - liveCount, localCount);
   for (int i = 0; i < localCount; i++) {
     struct tm t;
     localtime_r(&local[i].arrivalEpoch, &t);
-    Serial.printf("  %s %d: %02d:%02d\n", local[i].live ? "LIVE" : "SCHED",
-                  i + 1, t.tm_hour, t.tm_min);
+    DBG("  %s %d: %02d:%02d\n", local[i].live ? "LIVE" : "SCHED",
+        i + 1, t.tm_hour, t.tm_min);
   }
   return localCount > 0;
 }
@@ -349,11 +357,10 @@ bool fetchAlerts() {
     // Only delay-type alerts.
     if (strstr(tmpl, "Delay") == nullptr) continue;
 
-    // Only alerts affecting our line (JSQ-33 / 33rd Street).
-    // PATH names lines like "JSQ-33", "NWK-WTC", "HOB-33".
+    // Only alerts affecting our line. PATH names lines like
+    // "JSQ-33", "NWK-WTC", "HOB-33". We match the JSQ-33 pattern.
     bool ourLine = strstr(subj, "JSQ-33") || strstr(msg, "JSQ-33") ||
-                   strstr(subj, "33rd")   || strstr(msg, "33rd")   ||
-                   strstr(subj, "JSQ")    || strstr(msg, "JSQ");
+                   strstr(subj, "JSQ-33rd") || strstr(msg, "JSQ-33rd");
     if (!ourLine) continue;
 
     active = true;
@@ -361,7 +368,7 @@ bool fetchAlerts() {
     break;
   }
   alertActive = active;
-  Serial.printf("Alerts: %s\n", active ? alertText : "none");
+  DBG("Alerts: %s\n", active ? alertText : "none");
   return true;
 }
 
@@ -405,8 +412,8 @@ bool fetchSchedule() {
   load(doc["sunday"].as<JsonArray>(),   rtSunday,   rtSundayCount);
 
   rtScheduleLoaded = (rtWeekdayCount > 0);
-  Serial.printf("Remote schedule loaded: %u/%u/%u\n",
-                rtWeekdayCount, rtSaturdayCount, rtSundayCount);
+  DBG("Remote schedule loaded: %u/%u/%u\n",
+      rtWeekdayCount, rtSaturdayCount, rtSundayCount);
   return rtScheduleLoaded;
 }
 
