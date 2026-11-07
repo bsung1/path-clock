@@ -31,9 +31,11 @@
 #define TRAIN_TRAIL       0     // extra LEDs trailing each train hand (0 = single LED)
 #define MAX_TRAINS        6     // how many upcoming trains to display
 #define USE_SCHEDULE      true  // fill in trains beyond the 2 from the live API
+#define FORCE_ALERT       false // TEST: force the service-alert display on
 
 // --- Timing ----------------------------------------------------------------
 #define FETCH_INTERVAL_MS  30000UL        // poll the live API every 30s
+#define ALERTS_INTERVAL_MS (2UL*60UL*1000UL)      // check alerts every 2 min
 #define SCHEDULE_INTERVAL_MS (6UL*3600UL*1000UL)  // refresh schedule every 6h
 #define WIFI_RETRY_MS      10000UL
 
@@ -42,6 +44,9 @@
 
 const char* API_URL =
     "https://www.panynj.gov/bin/portauthority/ridepath.json";
+
+const char* ALERTS_URL =
+    "https://www.panynj.gov/bin/portauthority/alerts.json";
 
 // Remote schedule (updated by GitHub Action). Falls back to the baked-in
 // path_schedule.h if this fetch fails.
@@ -57,7 +62,12 @@ struct Train {
   bool   valid;
   bool   live;           // true = from real-time API, false = from schedule
   bool   viaHoboken;     // true = ATW route (alternates orange/blue)
+  int    delayMin;       // minutes late vs schedule (0 = on time, <0 = early)
 };
+
+// Service alert state (from alerts.json)
+bool alertActive = false;      // a delay alert is currently open
+char alertText[64] = {0};      // short description for logging
 
 Train trains[MAX_TRAINS];     // upcoming trains
 int   trainCount = 0;         // how many are valid
@@ -87,8 +97,10 @@ static const CRGB COLOR_SCHED = CRGB(0xFF, 0xB0, 0x00); // light amber - schedul
 
 // Forward declarations
 void fillFromSchedule(Train* buf, int& count);
+void computeDelays(Train* buf, int count);
 void fetchTask(void* param);
 bool fetchSchedule();
+bool fetchAlerts();
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -226,6 +238,7 @@ bool fetchTrains() {
         local[localCount].valid        = true;
         local[localCount].live         = true;
         local[localCount].viaHoboken   = false;
+        local[localCount].delayMin     = 0;            // set below
         localCount++;
       }
     }
@@ -233,6 +246,10 @@ bool fetchTrains() {
 
   // Fill remaining slots from the static schedule.
   if (USE_SCHEDULE) fillFromSchedule(local, localCount);
+
+  // --- Compute delay for each live train vs its nearest schedule slot ---
+  // (fillFromSchedule already claimed slots, so we re-scan the timetable.)
+  computeDelays(local, localCount);
 
   // Publish atomically.
   if (xSemaphoreTake(trainsMutex, portMAX_DELAY) == pdTRUE) {
@@ -252,6 +269,100 @@ bool fetchTrains() {
                   i + 1, t.tm_hour, t.tm_min);
   }
   return localCount > 0;
+}
+
+// ---------------------------------------------------------------------------
+// Delay computation
+// ---------------------------------------------------------------------------
+// For each live train, find the nearest scheduled departure and record the
+// difference in minutes. Positive = late, negative = early.
+void computeDelays(Train* buf, int count) {
+  struct tm nowTm;
+  time_t nowEpoch = time(nullptr);
+  localtime_r(&nowEpoch, &nowTm);
+
+  const SchedEntry* sched;
+  uint16_t schedCount;
+  if (rtScheduleLoaded) {
+    if (nowTm.tm_wday == 0)      { sched = (const SchedEntry*)rtSunday;   schedCount = rtSundayCount; }
+    else if (nowTm.tm_wday == 6) { sched = (const SchedEntry*)rtSaturday; schedCount = rtSaturdayCount; }
+    else                         { sched = (const SchedEntry*)rtWeekday;  schedCount = rtWeekdayCount; }
+  } else if (nowTm.tm_wday == 0) { sched = SCHED_SUNDAY;   schedCount = SCHED_SUNDAY_COUNT; }
+  else if (nowTm.tm_wday == 6)   { sched = SCHED_SATURDAY; schedCount = SCHED_SATURDAY_COUNT; }
+  else                           { sched = SCHED_WEEKDAY;  schedCount = SCHED_WEEKDAY_COUNT; }
+
+  for (int j = 0; j < count; j++) {
+    if (!buf[j].live) continue;
+    long bestDiff = 30 * 60;   // only match within 30 min
+    for (uint16_t i = 0; i < schedCount; i++) {
+      struct tm depTm = nowTm;
+      depTm.tm_hour = sched[i].minute / 60;
+      depTm.tm_min  = sched[i].minute % 60;
+      depTm.tm_sec  = 0;
+      long diff = labs((long)(mktime(&depTm) - buf[j].arrivalEpoch));
+      if (diff < bestDiff) bestDiff = diff;
+    }
+    if (bestDiff < 30 * 60) {
+      // Recompute signed difference against the best match.
+      long bestSigned = 0; long bestAbs = 30 * 60;
+      for (uint16_t i = 0; i < schedCount; i++) {
+        struct tm depTm = nowTm;
+        depTm.tm_hour = sched[i].minute / 60;
+        depTm.tm_min  = sched[i].minute % 60;
+        depTm.tm_sec  = 0;
+        long signedDiff = (long)(buf[j].arrivalEpoch - mktime(&depTm));
+        if (labs(signedDiff) < bestAbs) { bestAbs = labs(signedDiff); bestSigned = signedDiff; }
+      }
+      buf[j].delayMin = (int)(bestSigned / 60);
+    } else {
+      buf[j].delayMin = 0;
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Service alerts fetch (PATH alerts.json)
+// ---------------------------------------------------------------------------
+// Sets alertActive if there's an OPEN delay alert affecting our line.
+bool fetchAlerts() {
+  if (WiFi.status() != WL_CONNECTED) return false;
+
+  HTTPClient http;
+  http.begin(ALERTS_URL);
+  http.setTimeout(10000);
+  int code = http.GET();
+  if (code != 200) { http.end(); return false; }
+  String payload = http.getString();
+  http.end();
+
+  JsonDocument doc;
+  if (deserializeJson(doc, payload)) return false;
+
+  bool active = false;
+  for (JsonObject a : doc.as<JsonArray>()) {
+    const char* state = a["state"] | "";
+    const char* tmpl  = a["TemplateName"] | "";
+    const char* subj  = a["Subject"] | "";
+    const char* msg   = a["SentMessage"] | "";
+
+    if (strcmp(state, "Open") != 0) continue;
+    // Only delay-type alerts.
+    if (strstr(tmpl, "Delay") == nullptr) continue;
+
+    // Only alerts affecting our line (JSQ-33 / 33rd Street).
+    // PATH names lines like "JSQ-33", "NWK-WTC", "HOB-33".
+    bool ourLine = strstr(subj, "JSQ-33") || strstr(msg, "JSQ-33") ||
+                   strstr(subj, "33rd")   || strstr(msg, "33rd")   ||
+                   strstr(subj, "JSQ")    || strstr(msg, "JSQ");
+    if (!ourLine) continue;
+
+    active = true;
+    strncpy(alertText, subj, sizeof(alertText) - 1);
+    break;
+  }
+  alertActive = active;
+  Serial.printf("Alerts: %s\n", active ? alertText : "none");
+  return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -371,6 +482,7 @@ void fillFromSchedule(Train* buf, int& count) {
     buf[count].valid        = true;
     buf[count].live         = false;
     buf[count].viaHoboken   = (sched[i].route == 1);
+    buf[count].delayMin     = 0;
     count++;
   }
 
@@ -417,14 +529,20 @@ void setup() {
 // Runs on core 0: fetches on an interval without blocking rendering.
 void fetchTask(void* param) {
   unsigned long lastSched = 0;
+  unsigned long lastAlerts = 0;
   bool firstRun = true;
   for (;;) {
     // Refresh the remote schedule periodically (and immediately on first run).
     if (firstRun || millis() - lastSched > SCHEDULE_INTERVAL_MS) {
-      firstRun = false;
       lastSched = millis();
       fetchSchedule();
     }
+    // Alerts change slowly - check every 2 minutes.
+    if (firstRun || millis() - lastAlerts > ALERTS_INTERVAL_MS) {
+      lastAlerts = millis();
+      fetchAlerts();
+    }
+    firstRun = false;
     fetchTrains();
     vTaskDelay(pdMS_TO_TICKS(FETCH_INTERVAL_MS));
   }
@@ -496,21 +614,19 @@ void loop() {
       }
 
       if (shown == 0) {
-        // --- NEXT TRAIN: flash, speeding up, then solid red under 4 min ---
+        // --- NEXT TRAIN: pulse (breathe), speeding up as it approaches ---
         if (minsUntil <= 4) {
           // Imminent: solid red, full brightness.
           drawHand(t.tm_min, CRGB(255, 0, 0), 255);
         } else {
-          // Mostly lit, with a short dark blink. The blink gets more
-          // frequent as the train approaches (period shrinks 2000->250ms),
-          // but the dark pulse itself stays brief (~90ms).
+          // Pulse rate rises as the train nears: ~0.25Hz far -> ~1.5Hz near.
+          // Map minsUntil 4..60 -> bpm 15..90.
           int span = 60 - 4;
           int d = minsUntil - 4;
           if (d > span) d = span;
-          uint32_t period = 250 + (uint32_t)((span - d) * 1750 / span);
-          const uint32_t DARK_MS = 90;
-          bool dark = (millis() % period) < DARK_MS;
-          if (!dark) drawHand(t.tm_min, baseColor, 255);
+          uint8_t bpm = 15 + (uint8_t)((span - d) * 75 / span);
+          uint8_t b = beatsin8(bpm, 40, 255);   // breathe 40..255
+          drawHand(t.tm_min, baseColor, b);
         }
       } else {
         // --- Other trains: steady, fading with order ---
@@ -523,6 +639,14 @@ void loop() {
     if (shown == 0 && !SHOW_CLOCK_HANDS) {
       // No upcoming trains and no clock: dim white ring as a fallback.
       fill_solid(leds, NUM_LEDS, CRGB(20, 20, 20));
+    }
+
+    // --- Service alert: whole ring breathes red (something's wrong) ---
+    if (alertActive || FORCE_ALERT) {
+      uint8_t b = beatsin8(10, 20, 120);   // slow red breath
+      for (int i = 0; i < NUM_LEDS; i++) {
+        leds[i] += CRGB(b, 0, 0);
+      }
     }
   }
 
