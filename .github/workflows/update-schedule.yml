@@ -1,0 +1,35 @@
+name: Update PATH schedule
+
+on:
+  schedule:
+    # Every Monday at 12:00 UTC (08:00 ET)
+    - cron: "0 12 * * 1"
+  workflow_dispatch: {}   # allow manual runs
+
+permissions:
+  contents: write
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Extract schedule
+        run: python3 tools/extract_schedule.py schedule.json
+
+      - name: Commit if changed
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          if git diff --quiet schedule.json; then
+            echo "No schedule change."
+          else
+            git add schedule.json
+            git commit -m "Update PATH schedule ($(date -u +%Y-%m-%d))"
+            git push
+          fi
