@@ -420,77 +420,83 @@ bool fetchSchedule() {
 // ---------------------------------------------------------------------------
 // Static schedule fill
 // ---------------------------------------------------------------------------
+// Returns the timetable for a given weekday (0=Sun..6=Sat).
+void pickSchedule(int wday, const SchedEntry** sched, uint16_t* cnt) {
+  if (rtScheduleLoaded) {
+    if (wday == 0)      { *sched = (const SchedEntry*)rtSunday;   *cnt = rtSundayCount; }
+    else if (wday == 6) { *sched = (const SchedEntry*)rtSaturday; *cnt = rtSaturdayCount; }
+    else                { *sched = (const SchedEntry*)rtWeekday;  *cnt = rtWeekdayCount; }
+  } else if (wday == 0) { *sched = SCHED_SUNDAY;   *cnt = SCHED_SUNDAY_COUNT; }
+  else if (wday == 6)   { *sched = SCHED_SATURDAY; *cnt = SCHED_SATURDAY_COUNT; }
+  else                  { *sched = SCHED_WEEKDAY;  *cnt = SCHED_WEEKDAY_COUNT; }
+}
+
 // Adds upcoming 33rd Street departures from the embedded GTFS timetable into
-// `buf`, skipping any already covered by a live train. Operates on a local
-// buffer so no lock is needed here.
+// `buf`, skipping any already covered by a live train. Rolls over into the
+// next days so late-night hours still show tomorrow's early trains.
 void fillFromSchedule(Train* buf, int& count) {
   struct tm nowTm;
   time_t nowEpoch = time(nullptr);
   localtime_r(&nowEpoch, &nowTm);
 
-  // Prefer the downloaded schedule; fall back to the baked-in one.
-  const SchedEntry* sched;
-  uint16_t schedCount;
-  if (rtScheduleLoaded) {
-    // Remote schedule uses the same {minute, route} layout.
-    if (nowTm.tm_wday == 0) {
-      sched = (const SchedEntry*)rtSunday;   schedCount = rtSundayCount;
-    } else if (nowTm.tm_wday == 6) {
-      sched = (const SchedEntry*)rtSaturday; schedCount = rtSaturdayCount;
-    } else {
-      sched = (const SchedEntry*)rtWeekday;  schedCount = rtWeekdayCount;
-    }
-  } else if (nowTm.tm_wday == 0) {          // Sunday
-    sched = SCHED_SUNDAY;   schedCount = SCHED_SUNDAY_COUNT;
-  } else if (nowTm.tm_wday == 6) {   // Saturday
-    sched = SCHED_SATURDAY; schedCount = SCHED_SATURDAY_COUNT;
-  } else {                           // Mon-Fri
-    sched = SCHED_WEEKDAY;  schedCount = SCHED_WEEKDAY_COUNT;
-  }
-
   int nowMin = nowTm.tm_hour * 60 + nowTm.tm_min;
 
-  // --- Dedup: each live train "claims" its nearest schedule slot ---
-  // This handles delays: a live train 5 min late still suppresses its
-  // scheduled counterpart instead of showing both.
+  // --- Dedup: each live train "claims" its nearest schedule slot today ---
   const long MATCH_WINDOW = 20 * 60;   // max seconds apart to be the same train
-  bool claimed[256] = {false};         // one flag per schedule entry
+  bool claimed[256] = {false};         // one flag per schedule entry (today only)
 
-  for (int j = 0; j < count; j++) {
-    if (!buf[j].live) continue;
-    long bestDiff = MATCH_WINDOW;
-    int  bestIdx  = -1;
-    for (uint16_t i = 0; i < schedCount; i++) {
-      if (claimed[i]) continue;
-      if (sched[i].minute <= nowMin) continue;
-      struct tm depTm = nowTm;
+  {
+    const SchedEntry* sched; uint16_t schedCount;
+    pickSchedule(nowTm.tm_wday, &sched, &schedCount);
+    for (int j = 0; j < count; j++) {
+      if (!buf[j].live) continue;
+      long bestDiff = MATCH_WINDOW;
+      int  bestIdx  = -1;
+      for (uint16_t i = 0; i < schedCount; i++) {
+        if (claimed[i]) continue;
+        if (sched[i].minute <= nowMin) continue;
+        struct tm depTm = nowTm;
+        depTm.tm_hour = sched[i].minute / 60;
+        depTm.tm_min  = sched[i].minute % 60;
+        depTm.tm_sec  = 0;
+        long diff = labs((long)(mktime(&depTm) - buf[j].arrivalEpoch));
+        if (diff < bestDiff) { bestDiff = diff; bestIdx = i; }
+      }
+      if (bestIdx >= 0) claimed[bestIdx] = true;
+    }
+  }
+
+  // --- Add unclaimed schedule entries, rolling into the next days ---
+  for (int dayOffset = 0; dayOffset <= 2 && count < MAX_TRAINS; dayOffset++) {
+    // Date for this offset.
+    struct tm dayTm = nowTm;
+    dayTm.tm_mday += dayOffset;
+    dayTm.tm_hour = 0;
+    dayTm.tm_min  = 0;
+    dayTm.tm_sec  = 0;
+    mktime(&dayTm);   // normalizes tm_mday/tm_wday across month boundaries
+
+    const SchedEntry* sched; uint16_t schedCount;
+    pickSchedule(dayTm.tm_wday, &sched, &schedCount);
+
+    for (uint16_t i = 0; i < schedCount && count < MAX_TRAINS; i++) {
+      // Only skip already-departed entries on today's schedule.
+      if (dayOffset == 0 && claimed[i]) continue;
+      if (dayOffset == 0 && sched[i].minute <= nowMin) continue;
+
+      struct tm depTm = dayTm;
       depTm.tm_hour = sched[i].minute / 60;
       depTm.tm_min  = sched[i].minute % 60;
       depTm.tm_sec  = 0;
-      long diff = labs((long)(mktime(&depTm) - buf[j].arrivalEpoch));
-      if (diff < bestDiff) { bestDiff = diff; bestIdx = i; }
+
+      buf[count].arrivalEpoch = mktime(&depTm);
+      buf[count].color        = COLOR_SCHED;  // lighter shade = scheduled
+      buf[count].valid        = true;
+      buf[count].live         = false;
+      buf[count].viaHoboken   = (sched[i].route == 1);
+      buf[count].delayMin     = 0;
+      count++;
     }
-    if (bestIdx >= 0) claimed[bestIdx] = true;
-  }
-
-  // --- Add unclaimed schedule entries ---
-  for (uint16_t i = 0; i < schedCount && count < MAX_TRAINS; i++) {
-    if (claimed[i]) continue;
-    int depMin = sched[i].minute;
-    if (depMin <= nowMin) continue;          // already departed
-
-    struct tm depTm = nowTm;
-    depTm.tm_hour = depMin / 60;
-    depTm.tm_min  = depMin % 60;
-    depTm.tm_sec  = 0;
-
-    buf[count].arrivalEpoch = mktime(&depTm);
-    buf[count].color        = COLOR_SCHED;  // lighter shade = scheduled
-    buf[count].valid        = true;
-    buf[count].live         = false;
-    buf[count].viaHoboken   = (sched[i].route == 1);
-    buf[count].delayMin     = 0;
-    count++;
   }
 
   // Sort by arrival time (simple insertion sort - tiny array).
@@ -616,7 +622,7 @@ void loop() {
       // them apart from the plain orange YEL trains.
       CRGB baseColor = snapshot[i].color;
       if (snapshot[i].viaHoboken) {
-        bool bluePhase = (millis() / 500) % 2;   // swap every 500ms
+        bool bluePhase = (millis() / 1500) % 2;  // swap every 1.5s
         baseColor = bluePhase ? COLOR_BLUE : snapshot[i].color;
       }
 
