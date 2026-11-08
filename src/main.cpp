@@ -535,8 +535,11 @@ void setup() {
     fetchTrains();   // fetch immediately so we don't wait a full interval
   }
 
-  // Background fetch task on core 0 (render loop runs on core 1).
-  xTaskCreatePinnedToCore(fetchTask, "fetch", 8192, nullptr, 1, nullptr, 0);
+  // Background fetch task. Runs on the same core as loop() (core 1) so the
+  // render loop's delay() keeps the idle task fed and the watchdog happy.
+  // (Pinning it to core 0 alone starves IDLE0 during long TLS handshakes.)
+  xTaskCreatePinnedToCore(fetchTask, "fetch", 8192, nullptr, 1, nullptr,
+                          ARDUINO_RUNNING_CORE);
 }
 
 // Runs on core 0: fetches on an interval without blocking rendering.
