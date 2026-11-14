@@ -5,6 +5,7 @@
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
 #include <time.h>
+#include <stdarg.h>
 #include "secrets.h"
 #include "path_schedule.h"
 
@@ -35,9 +36,35 @@
 #define FORCE_ALERT       false // TEST: force the service-alert display on
 #define DEBUG_LOG         true  // verbose serial logging (set false to quiet)
 
+// --- Remote logging (telnet) -----------------------------------------------
+// Streams all DBG() output over WiFi so you can watch logs while the board
+// runs on external 5V with no USB attached. Connect from a Mac with:
+//     nc <STATIC_IP> 23
+#define LOG_PORT          23
+#define USE_STATIC_IP     true
+// Static IP so you always know where to connect (must match your subnet).
+IPAddress STATIC_IP(192, 168, 1, 60);
+IPAddress STATIC_GW(192, 168, 1, 1);
+IPAddress STATIC_MASK(255, 255, 255, 0);
+IPAddress STATIC_DNS(192, 168, 1, 1);
+
+WiFiServer logServer(LOG_PORT);
+WiFiClient logClient;
+
+// Print to Serial and (if connected) to the telnet log client.
+void logPrintf(const char* fmt, ...) {
+  char buf[256];
+  va_list args;
+  va_start(args, fmt);
+  vsnprintf(buf, sizeof(buf), fmt, args);
+  va_end(args);
+  Serial.print(buf);
+  if (logClient && logClient.connected()) logClient.print(buf);
+}
+
 // Verbose logging macro - compiles out when DEBUG_LOG is false.
 #if DEBUG_LOG
-  #define DBG(...) Serial.printf(__VA_ARGS__)
+  #define DBG(...) logPrintf(__VA_ARGS__)
 #else
   #define DBG(...) do {} while (0)
 #endif
@@ -159,6 +186,11 @@ void connectWifi() {
   // Disable modem sleep: the radio powering down between beacons causes
   // intermittent TLS/HTTPS connection failures (HTTP GET -1).
   WiFi.setSleep(false);
+#if USE_STATIC_IP
+  if (!WiFi.config(STATIC_IP, STATIC_GW, STATIC_MASK, STATIC_DNS)) {
+    Serial.println("\nStatic IP config failed, using DHCP");
+  }
+#endif
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
 
   unsigned long start = millis();
@@ -173,6 +205,7 @@ void connectWifi() {
     Serial.print("WiFi connected. IP: ");
     Serial.print(WiFi.localIP());
     Serial.printf("  RSSI: %d dBm\n", WiFi.RSSI());
+    Serial.printf("Log server: nc %s %d\n", WiFi.localIP().toString().c_str(), LOG_PORT);
   } else {
     wifiOk = false;
     Serial.println("WiFi connection FAILED");
@@ -548,6 +581,12 @@ void setup() {
   connectWifi();
   if (!wifiOk) showStatus(CRGB(40, 0, 0));  // red = no wifi
 
+  // Start the telnet log server so logs are reachable over WiFi (no USB).
+  if (wifiOk) {
+    logServer.begin();
+    logServer.setNoDelay(true);
+  }
+
   // Create the mutex BEFORE any fetch (fetchTrains locks it).
   trainsMutex = xSemaphoreCreateMutex();
 
@@ -592,6 +631,18 @@ void loop() {
   if (WiFi.status() != WL_CONNECTED && now - lastWifiTry > WIFI_RETRY_MS) {
     lastWifiTry = now;
     connectWifi();
+  }
+
+  // Accept a new telnet log client (only one at a time).
+  if (logServer.hasClient()) {
+    WiFiClient newClient = logServer.available();
+    if (logClient && logClient.connected()) {
+      newClient.stop();   // busy - reject the extra connection
+    } else {
+      logClient = newClient;
+      logClient.setNoDelay(true);
+      logClient.printf("\n=== PATH clock log (heap %u) ===\n", ESP.getFreeHeap());
+    }
   }
 
   // Snapshot the train list under the mutex (fetch task may be updating it).
@@ -693,12 +744,15 @@ void loop() {
   static unsigned long lastLedDbg = 0;
   if (millis() - lastLedDbg > 5000) {
     lastLedDbg = millis();
-    Serial.print("LIT:");
-    for (int i = 0; i < NUM_LEDS; i++) {
+    char line[512];
+    int n = snprintf(line, sizeof(line), "LIT:");
+    for (int i = 0; i < NUM_LEDS && n < (int)sizeof(line) - 24; i++) {
       if (leds[i].r || leds[i].g || leds[i].b)
-        Serial.printf(" %d=(%d,%d,%d)", i, leds[i].r, leds[i].g, leds[i].b);
+        n += snprintf(line + n, sizeof(line) - n, " %d=(%d,%d,%d)",
+                      i, leds[i].r, leds[i].g, leds[i].b);
     }
-    Serial.println();
+    snprintf(line + n, sizeof(line) - n, "\n");
+    logPrintf("%s", line);
   }
 #endif
 

@@ -7,3 +7,4 @@
 ; WiFi credentials - never commit
 src/secrets.h
 serial_log.txt
+wifi_log.txt
