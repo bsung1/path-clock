@@ -1,6 +1,7 @@
 #include <Arduino.h>
 #include <FastLED.h>
 #include <WiFi.h>
+#include <WiFiClientSecure.h>
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
 #include <time.h>
@@ -60,6 +61,12 @@ const char* ALERTS_URL =
 // path_schedule.h if this fetch fails.
 const char* SCHEDULE_URL =
     "https://raw.githubusercontent.com/bsung1/path-clock/main/schedule.json";
+
+// Shared TLS client. setInsecure() skips certificate validation, which avoids
+// intermittent handshake failures when the ESP32 clock is slightly off (cert
+// appears "not yet valid") or the CA bundle is stale. We're only fetching
+// public, read-only train data, so this is acceptable.
+WiFiClientSecure secureClient;
 
 CRGB leds[NUM_LEDS];
 
@@ -149,6 +156,9 @@ void showStatus(CRGB color) {
 void connectWifi() {
   Serial.printf("Connecting to WiFi \"%s\"", WIFI_SSID);
   WiFi.mode(WIFI_STA);
+  // Disable modem sleep: the radio powering down between beacons causes
+  // intermittent TLS/HTTPS connection failures (HTTP GET -1).
+  WiFi.setSleep(false);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
 
   unsigned long start = millis();
@@ -161,7 +171,8 @@ void connectWifi() {
   if (WiFi.status() == WL_CONNECTED) {
     wifiOk = true;
     Serial.print("WiFi connected. IP: ");
-    Serial.println(WiFi.localIP());
+    Serial.print(WiFi.localIP());
+    Serial.printf("  RSSI: %d dBm\n", WiFi.RSSI());
   } else {
     wifiOk = false;
     Serial.println("WiFi connection FAILED");
@@ -202,18 +213,27 @@ bool fetchTrains() {
   wifiOk = true;
 
   HTTPClient http;
-  http.begin(API_URL);
+  http.begin(secureClient, API_URL);
   http.setTimeout(10000);
   int code = http.GET();
   if (code != 200) {
-    Serial.printf("HTTP GET failed: %d\n", code);
+    // One transient failure (TLS handshake, DNS) shouldn't skip a whole cycle.
+    Serial.printf("HTTP GET failed: %d (retrying)\n", code);
     http.end();
-    return false;
+    delay(500);
+    http.begin(secureClient, API_URL);
+    http.setTimeout(10000);
+    code = http.GET();
+    if (code != 200) {
+      Serial.printf("HTTP GET failed again: %d\n", code);
+      http.end();
+      return false;
+    }
   }
 
   String payload = http.getString();
   http.end();
-  DBG("HTTP 200, %u bytes\n", payload.length());
+  DBG("HTTP 200, %u bytes, free heap %u\n", payload.length(), ESP.getFreeHeap());
 
   JsonDocument doc;
   DeserializationError err = deserializeJson(doc, payload);
@@ -336,7 +356,7 @@ bool fetchAlerts() {
   if (WiFi.status() != WL_CONNECTED) return false;
 
   HTTPClient http;
-  http.begin(ALERTS_URL);
+  http.begin(secureClient, ALERTS_URL);
   http.setTimeout(10000);
   int code = http.GET();
   if (code != 200) { http.end(); return false; }
@@ -381,7 +401,7 @@ bool fetchSchedule() {
   if (WiFi.status() != WL_CONNECTED) return false;
 
   HTTPClient http;
-  http.begin(SCHEDULE_URL);
+  http.begin(secureClient, SCHEDULE_URL);
   http.setTimeout(10000);
   int code = http.GET();
   if (code != 200) {
@@ -524,6 +544,7 @@ void setup() {
   FastLED.clear(true);
 
   showStatus(CRGB(0, 0, 40));   // dim blue = booting
+  secureClient.setInsecure();   // skip TLS cert validation (public data only)
   connectWifi();
   if (!wifiOk) showStatus(CRGB(40, 0, 0));  // red = no wifi
 
@@ -641,12 +662,13 @@ void loop() {
           int d = minsUntil - 4;
           if (d > span) d = span;
           uint8_t bpm = 15 + (uint8_t)((span - d) * 75 / span);
-          uint8_t b = beatsin8(bpm, 40, 255);   // breathe 40..255
+          uint8_t b = beatsin8(bpm, 140, 255);  // breathe 140..255 (stays visible)
           drawHand(t.tm_min, baseColor, b);
         }
       } else {
-        // --- Other trains: steady, fading with order ---
-        uint8_t b = (shown == 1) ? 150 : (shown == 2) ? 100 : 60;
+        // --- Other trains: steady, gentle fade with order ---
+        // Keep all clearly visible (global BRIGHTNESS already dims them).
+        uint8_t b = (shown == 1) ? 255 : (shown == 2) ? 220 : 190;
         drawHand(t.tm_min, baseColor, b);
       }
       shown++;
@@ -665,6 +687,20 @@ void loop() {
       }
     }
   }
+
+#if DEBUG_LOG
+  // Print which LEDs are lit (every 5s) to diagnose display issues.
+  static unsigned long lastLedDbg = 0;
+  if (millis() - lastLedDbg > 5000) {
+    lastLedDbg = millis();
+    Serial.print("LIT:");
+    for (int i = 0; i < NUM_LEDS; i++) {
+      if (leds[i].r || leds[i].g || leds[i].b)
+        Serial.printf(" %d=(%d,%d,%d)", i, leds[i].r, leds[i].g, leds[i].b);
+    }
+    Serial.println();
+  }
+#endif
 
   FastLED.show();
   delay(50);
