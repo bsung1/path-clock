@@ -25,9 +25,10 @@
 #define BRIGHTNESS  64
 
 // Physical rotation of the ring: how many LEDs to shift so that logical
-// position 0 lands on the LED that's actually at 12 o'clock. If the minute
-// hand shows at LED 28 when it should be at 16, set this to 12.
-#define LED_OFFSET  12
+// position 0 lands on the LED that's actually at 12 o'clock. The ring is
+// mounted with the data wires at the bottom, so LED 0 sits at 6 o'clock and
+// 12/6 are flipped -> rotate 180 degrees = 30 LEDs.
+#define LED_OFFSET  30
 
 // --- What we're tracking ---------------------------------------------------
 #define STATION_CODE  "GRV"     // Grove St
