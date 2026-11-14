@@ -133,9 +133,12 @@ static const CRGB COLOR_33RD = CRGB(0xFF, 0x99, 0x00);  // orange - 33rd St
 static const CRGB COLOR_WTC  = CRGB(0xD9, 0x3A, 0x30);  // red - WTC
 static const CRGB COLOR_BLUE = CRGB(0x4D, 0x92, 0xFB);  // blue - via Hoboken hint
 
-// Live vs scheduled shades (live = darker/saturated, scheduled = lighter amber)
-static const CRGB COLOR_LIVE = CRGB(0x80, 0x38, 0x00);  // dark orange - live
-static const CRGB COLOR_SCHED = CRGB(0xFF, 0xB0, 0x00); // light amber - scheduled (no blue)
+// Live vs scheduled shades. Both stay bright (global BRIGHTNESS already dims
+// everything); they're told apart by HUE, not brightness:
+//   live      = saturated orange (more red)
+//   scheduled = amber (more yellow)
+static const CRGB COLOR_LIVE = CRGB(0xFF, 0x50, 0x00);  // bright orange - live
+static const CRGB COLOR_SCHED = CRGB(0xFF, 0xB0, 0x00); // amber - scheduled
 
 // Forward declarations
 void fillFromSchedule(Train* buf, int& count);
@@ -155,12 +158,16 @@ CRGB hexToColor(const char* hex) {
   return CRGB((v >> 16) & 0xFF, (v >> 8) & 0xFF, v & 0xFF);
 }
 
-// Set one LED to a color scaled by brightness (max-combine so brighter wins).
+// Set one LED to a color scaled by brightness. Max-combines per channel so a
+// brighter hand isn't erased by a dimmer one drawn later (e.g. a clock hand
+// landing on the same LED as a train).
 void setPixel(int idx, CRGB color, uint8_t brightness) {
   idx = ((idx % NUM_LEDS) + NUM_LEDS) % NUM_LEDS;
   CRGB c = color;
   c.nscale8_video(brightness);
-  leds[idx] = c;
+  leds[idx].r = max(leds[idx].r, c.r);
+  leds[idx].g = max(leds[idx].g, c.g);
+  leds[idx].b = max(leds[idx].b, c.b);
 }
 
 // Draw a "hand" at a position with an optional trailing glow.
@@ -688,7 +695,9 @@ void loop() {
       long secsUntil = (long)(snapshot[i].arrivalEpoch - nowEpoch);
       if (secsUntil < 0) continue;              // train already left
       int minsUntil = (secsUntil + 59) / 60;    // round up
-      if (minsUntil > 60) continue;             // beyond the hour face
+      // Show only the next 50 min so trains don't crowd the top of the ring
+      // (near 12 o'clock) where the clock hands sit.
+      if (minsUntil > 50) continue;
 
       struct tm t;
       localtime_r(&snapshot[i].arrivalEpoch, &t);
@@ -708,12 +717,12 @@ void loop() {
           drawHand(t.tm_min, CRGB(255, 0, 0), 255);
         } else {
           // Pulse rate rises as the train nears: ~0.25Hz far -> ~1.5Hz near.
-          // Map minsUntil 4..60 -> bpm 15..90.
-          int span = 60 - 4;
+          // Map minsUntil 4..50 -> bpm 15..90.
+          int span = 50 - 4;
           int d = minsUntil - 4;
           if (d > span) d = span;
           uint8_t bpm = 15 + (uint8_t)((span - d) * 75 / span);
-          uint8_t b = beatsin8(bpm, 140, 255);  // breathe 140..255 (stays visible)
+          uint8_t b = beatsin8(bpm, 180, 255);  // breathe 180..255 (stays visible)
           drawHand(t.tm_min, baseColor, b);
         }
       } else {
