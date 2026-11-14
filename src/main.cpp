@@ -22,7 +22,7 @@
 
 #define LED_PIN     5
 #define NUM_LEDS    60
-#define BRIGHTNESS  64
+#define BRIGHTNESS  32
 
 // Physical rotation of the ring: how many LEDs to shift so that logical
 // position 0 lands on the LED that's actually at 12 o'clock. The ring is
@@ -95,11 +95,26 @@ const char* ALERTS_URL =
 const char* SCHEDULE_URL =
     "https://raw.githubusercontent.com/bsung1/path-clock/main/schedule.json";
 
-// Shared TLS client. setInsecure() skips certificate validation, which avoids
+// TLS client. setInsecure() skips certificate validation, which avoids
 // intermittent handshake failures when the ESP32 clock is slightly off (cert
 // appears "not yet valid") or the CA bundle is stale. We're only fetching
 // public, read-only train data, so this is acceptable.
 WiFiClientSecure secureClient;
+
+// GET a URL. Returns the HTTP code, or a negative error. On success, `out`
+// holds the body. Resets the client first so a previous failed/hung request
+// can't leave it in a bad state (which froze the train display).
+int httpGet(const char* url, String& out) {
+  secureClient.stop();            // drop any stale connection
+  HTTPClient http;
+  http.setConnectTimeout(8000);   // ms - TCP/TLS connect (the real hang fix)
+  http.setTimeout(10000);         // ms - response read
+  if (!http.begin(secureClient, url)) return -1000;
+  int code = http.GET();
+  if (code == 200) out = http.getString();
+  http.end();
+  return code;
+}
 
 CRGB leds[NUM_LEDS];
 
@@ -272,27 +287,18 @@ bool fetchTrains() {
   }
   wifiOk = true;
 
-  HTTPClient http;
-  http.begin(secureClient, API_URL);
-  http.setTimeout(10000);
-  int code = http.GET();
+  String payload;
+  int code = httpGet(API_URL, payload);
   if (code != 200) {
     // One transient failure (TLS handshake, DNS) shouldn't skip a whole cycle.
     Serial.printf("HTTP GET failed: %d (retrying)\n", code);
-    http.end();
     delay(500);
-    http.begin(secureClient, API_URL);
-    http.setTimeout(10000);
-    code = http.GET();
+    code = httpGet(API_URL, payload);
     if (code != 200) {
       Serial.printf("HTTP GET failed again: %d\n", code);
-      http.end();
       return false;
     }
   }
-
-  String payload = http.getString();
-  http.end();
   DBG("HTTP 200, %u bytes, free heap %u\n", payload.length(), ESP.getFreeHeap());
 
   JsonDocument doc;
@@ -415,13 +421,9 @@ void computeDelays(Train* buf, int count) {
 bool fetchAlerts() {
   if (WiFi.status() != WL_CONNECTED) return false;
 
-  HTTPClient http;
-  http.begin(secureClient, ALERTS_URL);
-  http.setTimeout(10000);
-  int code = http.GET();
-  if (code != 200) { http.end(); return false; }
-  String payload = http.getString();
-  http.end();
+  String payload;
+  int code = httpGet(ALERTS_URL, payload);
+  if (code != 200) return false;
 
   JsonDocument doc;
   if (deserializeJson(doc, payload)) return false;
@@ -460,17 +462,12 @@ bool fetchAlerts() {
 bool fetchSchedule() {
   if (WiFi.status() != WL_CONNECTED) return false;
 
-  HTTPClient http;
-  http.begin(secureClient, SCHEDULE_URL);
-  http.setTimeout(10000);
-  int code = http.GET();
+  String payload;
+  int code = httpGet(SCHEDULE_URL, payload);
   if (code != 200) {
     Serial.printf("Schedule fetch failed: %d\n", code);
-    http.end();
     return false;
   }
-  String payload = http.getString();
-  http.end();
 
   JsonDocument doc;
   if (deserializeJson(doc, payload)) {
