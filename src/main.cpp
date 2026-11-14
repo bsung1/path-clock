@@ -222,22 +222,35 @@ void connectWifi() {
 // ---------------------------------------------------------------------------
 // NTP time sync
 // ---------------------------------------------------------------------------
+// Retries a few times. configTzTime() resolves the NTP hostnames via DNS, which
+// can fail right after WiFi connects (DNS not ready yet), so we retry with a
+// short delay. Falls back to IP-literal NTP servers to skip DNS entirely.
 void syncTime() {
-  configTzTime(TZ_STRING, "pool.ntp.org", "time.nist.gov");
-  Serial.print("Syncing time");
   struct tm t;
-  unsigned long start = millis();
-  while (!getLocalTime(&t, 1000) && millis() - start < 15000) {
-    Serial.print(".");
+  for (int attempt = 1; attempt <= 3 && !timeOk; attempt++) {
+    Serial.printf("Syncing time (attempt %d)", attempt);
+    // First attempt: hostnames. Later attempts: IP literals (no DNS needed).
+    if (attempt == 1) {
+      configTzTime(TZ_STRING, "pool.ntp.org", "time.nist.gov");
+    } else {
+      configTzTime(TZ_STRING, "216.239.35.0", "162.159.200.1");  // Google, Cloudflare
+    }
+
+    unsigned long start = millis();
+    while (!getLocalTime(&t, 1000) && millis() - start < 15000) {
+      Serial.print(".");
+    }
+    Serial.println();
+
+    if (getLocalTime(&t, 100)) {
+      timeOk = true;
+      Serial.printf("Time synced: %02d:%02d:%02d\n", t.tm_hour, t.tm_min, t.tm_sec);
+    } else {
+      Serial.println("Time sync FAILED");
+      delay(1000);
+    }
   }
-  Serial.println();
-  if (getLocalTime(&t, 100)) {
-    timeOk = true;
-    Serial.printf("Time synced: %02d:%02d:%02d\n", t.tm_hour, t.tm_min, t.tm_sec);
-  } else {
-    timeOk = false;
-    Serial.println("Time sync FAILED");
-  }
+  if (!timeOk) Serial.println("Time sync gave up - clock hands disabled");
 }
 
 // ---------------------------------------------------------------------------
@@ -502,7 +515,11 @@ void fillFromSchedule(Train* buf, int& count) {
   int nowMin = nowTm.tm_hour * 60 + nowTm.tm_min;
 
   // --- Dedup: each live train "claims" its nearest schedule slot today ---
-  const long MATCH_WINDOW = 20 * 60;   // max seconds apart to be the same train
+  // Keep the window tight (5 min). A wide window let a late/early live train
+  // claim a slot far away, which suppressed a real scheduled train and left a
+  // big empty gap on the ring. We also allow matching slots that have already
+  // passed, so a late train claims its OWN slot rather than stealing the next.
+  const long MATCH_WINDOW = 5 * 60;    // max seconds apart to be the same train
   bool claimed[256] = {false};         // one flag per schedule entry (today only)
 
   {
@@ -514,7 +531,6 @@ void fillFromSchedule(Train* buf, int& count) {
       int  bestIdx  = -1;
       for (uint16_t i = 0; i < schedCount; i++) {
         if (claimed[i]) continue;
-        if (sched[i].minute <= nowMin) continue;
         struct tm depTm = nowTm;
         depTm.tm_hour = sched[i].minute / 60;
         depTm.tm_min  = sched[i].minute % 60;
@@ -599,14 +615,16 @@ void setup() {
 
   if (wifiOk) {
     syncTime();
-    fetchTrains();   // fetch immediately so we don't wait a full interval
   }
 
   // Background fetch task. Runs on the same core as loop() (core 1) so the
   // render loop's delay() keeps the idle task fed and the watchdog happy.
   // (Pinning it to core 0 alone starves IDLE0 during long TLS handshakes.)
+  // It fetches immediately on first run, so we don't block setup() here.
+  Serial.println("Starting fetch task...");
   xTaskCreatePinnedToCore(fetchTask, "fetch", 8192, nullptr, 1, nullptr,
                           ARDUINO_RUNNING_CORE);
+  Serial.println("Setup complete.");
 }
 
 // Runs on core 0: fetches on an interval without blocking rendering.
@@ -615,17 +633,21 @@ void fetchTask(void* param) {
   unsigned long lastAlerts = 0;
   bool firstRun = true;
   for (;;) {
+    DBG("fetchTask: cycle start (heap %u)\n", ESP.getFreeHeap());
     // Refresh the remote schedule periodically (and immediately on first run).
     if (firstRun || millis() - lastSched > SCHEDULE_INTERVAL_MS) {
       lastSched = millis();
+      DBG("fetchTask: fetching schedule...\n");
       fetchSchedule();
     }
     // Alerts change slowly - check every 2 minutes.
     if (firstRun || millis() - lastAlerts > ALERTS_INTERVAL_MS) {
       lastAlerts = millis();
+      DBG("fetchTask: fetching alerts...\n");
       fetchAlerts();
     }
     firstRun = false;
+    DBG("fetchTask: fetching trains...\n");
     fetchTrains();
     vTaskDelay(pdMS_TO_TICKS(FETCH_INTERVAL_MS));
   }
@@ -638,6 +660,13 @@ void loop() {
   if (WiFi.status() != WL_CONNECTED && now - lastWifiTry > WIFI_RETRY_MS) {
     lastWifiTry = now;
     connectWifi();
+  }
+
+  // Retry time sync if it never succeeded (e.g. DNS wasn't ready at boot).
+  static unsigned long lastTimeTry = 0;
+  if (!timeOk && WiFi.status() == WL_CONNECTED && now - lastTimeTry > 30000) {
+    lastTimeTry = now;
+    syncTime();
   }
 
   // Accept a new telnet log client (only one at a time).
