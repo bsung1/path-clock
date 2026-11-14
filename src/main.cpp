@@ -24,6 +24,11 @@
 #define NUM_LEDS    60
 #define BRIGHTNESS  64
 
+// Physical rotation of the ring: how many LEDs to shift so that logical
+// position 0 lands on the LED that's actually at 12 o'clock. If the minute
+// hand shows at LED 28 when it should be at 16, set this to 12.
+#define LED_OFFSET  12
+
 // --- What we're tracking ---------------------------------------------------
 #define STATION_CODE  "GRV"     // Grove St
 #define DIRECTION     "ToNY"    // To New York
@@ -160,9 +165,10 @@ CRGB hexToColor(const char* hex) {
 
 // Set one LED to a color scaled by brightness. Max-combines per channel so a
 // brighter hand isn't erased by a dimmer one drawn later (e.g. a clock hand
-// landing on the same LED as a train).
+// landing on the same LED as a train). Applies LED_OFFSET so logical position
+// 0 maps to the LED physically at 12 o'clock.
 void setPixel(int idx, CRGB color, uint8_t brightness) {
-  idx = ((idx % NUM_LEDS) + NUM_LEDS) % NUM_LEDS;
+  idx = ((idx + LED_OFFSET) % NUM_LEDS + NUM_LEDS) % NUM_LEDS;
   CRGB c = color;
   c.nscale8_video(brightness);
   leds[idx].r = max(leds[idx].r, c.r);
